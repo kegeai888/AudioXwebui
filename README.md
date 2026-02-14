@@ -26,14 +26,14 @@ To train this unified model, we construct a large-scale, high-quality dataset, I
 ## ✨ Teaser
 
 <p align="center">
-  <img width="1819" height="783" alt="teaser" src="https://github.com/user-attachments/assets/af8da477-492f-413b-8c77-d3b7e8424321" />
+  <img width="1819" height="783" alt="teaser" src="https://github.com/user-attachments/assets/ca7e768a-a113-423d-ac7e-40b7437c5538" />
 </p>
 <p style="text-align: left;">Performance comparison of AudioX against baselines. (a) Comprehensive comparison across multiple benchmarks via Inception Score. (b) Results on instruction-following benchmarks.</p>
 
 ## ✨ Method
 
 <p align="center">
-  <img width="1813" height="658" alt="method" src="https://github.com/user-attachments/assets/05d45457-a9e1-4048-a4ef-a4b60b37f238" />
+  <img width="1813" height="658" alt="method" src="https://github.com/user-attachments/assets/f040df46-faf2-4d0e-82f4-65dc2f625558" />
 </p>
 <p align="center">Overview of the AudioX Framework.</p>
 
