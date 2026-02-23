@@ -51,8 +51,8 @@ To train this unified model, we construct a large-scale, high-quality dataset, I
 
 ```bash
 # Clone the repository
-git clone https://github.com/ZeyueT/AudioX.git
-cd AudioX
+git clone https://github.com/kegeai888/AudioXwebui.git
+cd AudioXwebui
 
 # Create conda environment
 conda create -n AudioX python=3.8.20

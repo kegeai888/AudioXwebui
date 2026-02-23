@@ -176,3 +176,5 @@ saved_ckpt/
 wandb/
 demo_result/
 model/
+cc.sh
+outputs/

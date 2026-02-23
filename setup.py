@@ -36,6 +36,7 @@ setup(
         'torchmetrics==0.11.4',
         'tqdm',
         'transformers',
+        'timm',
         'v-diffusion-pytorch==0.0.2',
         'vector-quantize-pytorch==1.9.14',
         'wandb',

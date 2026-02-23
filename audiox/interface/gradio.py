@@ -2,12 +2,16 @@ import gc
 import platform
 import os
 import subprocess as sp  # For merging audio and video
+from datetime import datetime
+from urllib.parse import quote
 
 import numpy as np
 import gradio as gr
-import json 
+import gradio_client.utils as gradio_client_utils
+import json
 import torch
 import torchaudio
+import soundfile as sf
 import torchvision
 import decord
 from decord import VideoReader
@@ -42,6 +46,28 @@ current_model = None
 current_sample_rate = None
 current_sample_size = None
 current_model_config = None
+
+
+_original_gradio_get_type = gradio_client_utils.get_type
+_original_gradio_json_schema_to_python_type = gradio_client_utils._json_schema_to_python_type
+
+
+def _safe_gradio_get_type(schema):
+    if isinstance(schema, bool):
+        return "boolean"
+    return _original_gradio_get_type(schema)
+
+
+def _safe_gradio_json_schema_to_python_type(schema, defs):
+    if schema is True:
+        return "Any"
+    if schema is False:
+        return "None"
+    return _original_gradio_json_schema_to_python_type(schema, defs)
+
+
+gradio_client_utils.get_type = _safe_gradio_get_type
+gradio_client_utils._json_schema_to_python_type = _safe_gradio_json_schema_to_python_type
 
 
 _SYNC_SIZE = 224
@@ -292,13 +318,15 @@ def generate_cond(
     else:
         target_fps = 5
 
-    original_video_path = video_path
     if video_file is not None:
-        video_path = video_file.name
+        resolved_video_path = video_file.name
     elif video_path:
-        video_path = video_path.strip()
+        resolved_video_path = video_path.strip()
     else:
-        video_path = None
+        resolved_video_path = None
+
+    original_video_path = resolved_video_path
+    video_path = resolved_video_path
 
     if audio_prompt_file is not None:
         print(f'audio_prompt_file: {audio_prompt_file}')
@@ -519,96 +547,196 @@ def generate_cond(
         raise ValueError(f"Unsupported model type: {model_type}")
 
     audio = rearrange(audio, "b d n -> d (b n)")
-    audio = audio.to(torch.float32).div(torch.max(torch.abs(audio))).clamp(-1, 1).mul(32767).to(torch.int16).cpu()
-    
-    output_dir = "demo_result"
+    audio = audio.to(torch.float32).div(torch.max(torch.abs(audio))).clamp(-1, 1)
+
+    output_dir = "outputs"
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
-    
-    audio_path = f"{output_dir}/output.wav"
-    torchaudio.save(audio_path, audio, sample_rate)
 
-    file_name = os.path.basename(original_video_path) if original_video_path else "output"
-    output_video_path = f"{output_dir}/{file_name}"
-        
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    base_name = f"outputs_{timestamp}"
+    audio_path = os.path.join(output_dir, f"{base_name}.wav")
+    suffix = 1
+    while os.path.exists(audio_path):
+        audio_path = os.path.join(output_dir, f"{base_name}_{suffix}.wav")
+        suffix += 1
+
+    audio_cpu = audio.detach().cpu().contiguous()
+    try:
+        torchaudio.save(audio_path, audio_cpu, sample_rate, format="wav", backend="soundfile")
+    except Exception:
+        sf.write(audio_path, audio_cpu.transpose(0, 1).numpy(), sample_rate)
+
     if original_video_path:
+        video_base = os.path.splitext(os.path.basename(audio_path))[0]
+        output_video_path = os.path.join(output_dir, f"{video_base}.mp4")
         merge_video_audio(original_video_path, audio_path, output_video_path, seconds_start, seconds_total)
+        output_video_html = _video_preview_html(output_video_path)
+    else:
+        output_video_html = ""
     
     torch.cuda.empty_cache()
     gc.collect()
 
-    return (output_video_path, audio_path)
+    return (output_video_html, audio_path)
 
 def toggle_custom_model(selected_model):
     return gr.Row.update(visible=(selected_model == "Custom Model"))
 
 
+def _space_examples_values(seed, prompt):
+    return [
+        prompt,
+        0,
+        10,
+        7.0,
+        100,
+        0,
+        seed,
+        "dpmpp-3m-sde",
+        0.03,
+        500,
+        0.0
+    ]
 
-def create_sampling_ui(model_options, model_config_map, inpainting=False):
-    with gr.Blocks() as demo:
-        gr.Markdown(
+
+def _file_obj_to_path(file_obj):
+    if file_obj is None:
+        return None
+    return getattr(file_obj, "name", None)
+
+
+def _text_path_or_none(path_text):
+    if not path_text:
+        return None
+    path_text = path_text.strip()
+    return path_text if path_text else None
+
+
+def _video_preview_html(path):
+    if not path:
+        return ""
+    if not os.path.exists(path):
+        return "<div>视频文件不存在或路径无效</div>"
+    file_url = "file=" + quote(os.path.abspath(path))
+    return (
+        "<div style=\"width:100%;text-align:center;\">"
+        f"<video controls style=\"max-width:600px;width:auto;height:auto;display:inline-block;\" src=\"{file_url}\"></video>"
+        "</div>"
+    )
+
+
+def _file_obj_to_video_html(file_obj):
+    return _video_preview_html(getattr(file_obj, "name", None) if file_obj is not None else None)
+
+
+def _text_path_to_video_html(path_text):
+    return _video_preview_html(_text_path_or_none(path_text))
+
+
+def create_sampling_ui(model_options, model_config_map, inpainting=False, space_like=False):
+    with gr.Blocks(
+        css="""
+        .video-preview,
+        .video-preview > div,
+        .video-preview [data-testid*="video"],
+        .video-preview .wrap,
+        .video-preview .container {
+            width: fit-content !important;
+            max-width: 600px !important;
+            display: inline-block !important;
+        }
+        .video-preview video,
+        .video-preview [data-testid*="video"] video {
+            width: auto !important;
+            max-width: 600px !important;
+            height: auto !important;
+            object-fit: contain !important;
+        }
+        """
+    ) as demo:
+        gr.HTML(
             """
-            # 🎧AudioX: A Unified Framework for Anything-to-Audio Generation
-            **[Project Page](https://zeyuet.github.io/AudioX/) · [Huggingface](https://huggingface.co/Zeyue7/AudioX) · [GitHub](https://github.com/ZeyueT/AudioX)**
+            <div class="app-banner">
+                <h1>AudioX 统一音频生成平台</h1>
+                <p>webUI二次开发 by 科哥 | 技术微信：312088415 公众号：科哥玩AI<br>
+                承诺永远开源使用 但是需要保留本人版权信息！</p>
+            </div>
             """
         )
 
+
         with gr.Row():
             with gr.Column():
-                prompt = gr.Textbox(show_label=False, placeholder="Enter your prompt")
-                negative_prompt = gr.Textbox(show_label=False, placeholder="Negative prompt", visible=False)
-                video_path = gr.Textbox(label="Video Path", placeholder="Enter video file path")
-                video_file = gr.File(label="Upload Video File")
-                audio_prompt_file = gr.File(label="Upload Audio Prompt File", visible=False)
-                audio_prompt_path = gr.Textbox(label="Audio Prompt Path", placeholder="Enter audio file path", visible=False)
+                prompt = gr.Textbox(show_label=False, placeholder="请输入提示词")
+                negative_prompt = gr.Textbox(show_label=False, placeholder="负向提示词", visible=False)
+                video_path = gr.Textbox(label="视频路径", placeholder="请输入视频文件路径")
+                video_file = gr.File(label="上传视频文件")
+                input_video_preview = gr.HTML(label="上传视频预览")
+                audio_prompt_file = gr.File(label="上传音频提示文件", visible=False)
+                audio_prompt_path = gr.Textbox(label="音频提示路径", placeholder="请输入音频文件路径", visible=False)
 
         with gr.Row():
             with gr.Column(scale=6):
-                with gr.Accordion("Video Params", open=False):                
-                    seconds_start_slider = gr.Slider(minimum=0, maximum=512, step=1, value=0, label="Video Seconds Start")
-                    seconds_total_slider = gr.Slider(minimum=0, maximum=10, step=1, value=10, label="Seconds Total", interactive=False)
+                with gr.Accordion("视频参数", open=False):
+                    seconds_start_slider = gr.Slider(minimum=0, maximum=512, step=1, value=0, label="视频起始秒")
+                    seconds_total_slider = gr.Slider(minimum=0, maximum=10, step=1, value=10, label="生成时长（秒）", interactive=False)
 
         with gr.Row():
             with gr.Column(scale=4):
-                with gr.Accordion("Sampler Params", open=False):
-                    steps_slider = gr.Slider(minimum=1, maximum=500, step=1, value=100, label="Steps")
-                    preview_every_slider = gr.Slider(minimum=0, maximum=100, step=1, value=0, label="Preview Every")
-                    cfg_scale_slider = gr.Slider(minimum=0.0, maximum=25.0, step=0.1, value=7.0, label="CFG Scale")
-                    seed_textbox = gr.Textbox(label="Seed (set to -1 for random seed)", value="-1")
+                with gr.Accordion("采样参数", open=False):
+                    steps_slider = gr.Slider(minimum=1, maximum=500, step=1, value=100, label="采样步数")
+                    preview_every_slider = gr.Slider(minimum=0, maximum=100, step=1, value=0, label="预览间隔")
+                    cfg_scale_slider = gr.Slider(minimum=0.0, maximum=25.0, step=0.1, value=7.0, label="CFG 强度")
+                    seed_textbox = gr.Textbox(label="随机种子（-1 为随机）", value="-1")
                     sampler_type_dropdown = gr.Dropdown(
                         ["dpmpp-2m-sde", "dpmpp-3m-sde", "k-heun", "k-lms", "k-dpmpp-2s-ancestral", "k-dpm-2", "k-dpm-fast"],
-                        label="Sampler Type",
+                        label="采样器类型",
                         value="dpmpp-3m-sde"
                     )
-                    sigma_min_slider = gr.Slider(minimum=0.0, maximum=2.0, step=0.01, value=0.03, label="Sigma Min")
-                    sigma_max_slider = gr.Slider(minimum=0.0, maximum=1000.0, step=0.1, value=500, label="Sigma Max")
-                    cfg_rescale_slider = gr.Slider(minimum=0.0, maximum=1, step=0.01, value=0.0, label="CFG Rescale Amount")
+                    sigma_min_slider = gr.Slider(minimum=0.0, maximum=2.0, step=0.01, value=0.03, label="Sigma 最小值")
+                    sigma_max_slider = gr.Slider(minimum=0.0, maximum=1000.0, step=0.1, value=500, label="Sigma 最大值")
+                    cfg_rescale_slider = gr.Slider(minimum=0.0, maximum=1, step=0.01, value=0.0, label="CFG 重缩放")
+
         with gr.Row():
             with gr.Column(scale=4):
-                with gr.Accordion("Init Audio", open=False, visible=False):
-                    init_audio_checkbox = gr.Checkbox(label="Use Init Audio")
-                    init_audio_input = gr.Audio(label="Init Audio")
-                    init_noise_level_slider = gr.Slider(minimum=0.1, maximum=100.0, step=0.01, value=0.1, label="Init Noise Level")
+                with gr.Accordion("初始音频", open=False, visible=False):
+                    init_audio_checkbox = gr.Checkbox(label="启用初始音频")
+                    init_audio_input = gr.Audio(label="初始音频")
+                    init_noise_level_slider = gr.Slider(minimum=0.1, maximum=100.0, step=0.01, value=0.1, label="初始噪声强度")
 
-        if inpainting: 
-            with gr.Accordion("Inpainting", open=False):
-                mask_cropfrom_slider = gr.Slider(minimum=0.0, maximum=100.0, step=0.1, value=0, label="Crop From %")
-                mask_pastefrom_slider = gr.Slider(minimum=0.0, maximum=100.0, step=0.1, value=0, label="Paste From %")
-                mask_pasteto_slider = gr.Slider(minimum=0.0, maximum=100.0, step=0.1, value=100, label="Paste To %")
-                mask_maskstart_slider = gr.Slider(minimum=0.0, maximum=100.0, step=0.1, value=50, label="Mask Start %")
-                mask_maskend_slider = gr.Slider(minimum=0.0, maximum=100.0, step=0.1, value=100, label="Mask End %")
-                mask_softnessL_slider = gr.Slider(minimum=0.0, maximum=100.0, step=0.1, value=0, label="Softmask Left Crossfade Length %")
-                mask_softnessR_slider = gr.Slider(minimum=0.0, maximum=100.0, step=0.1, value=0, label="Softmask Right Crossfade Length %")
-                mask_marination_slider = gr.Slider(minimum=0.0, maximum=1, step=0.0001, value=0, label="Marination Level", visible=False)
+        if inpainting:
+            with gr.Accordion("局部重绘", open=False):
+                mask_cropfrom_slider = gr.Slider(minimum=0.0, maximum=100.0, step=0.1, value=0, label="裁剪起点（%）")
+                mask_pastefrom_slider = gr.Slider(minimum=0.0, maximum=100.0, step=0.1, value=0, label="粘贴起点（%）")
+                mask_pasteto_slider = gr.Slider(minimum=0.0, maximum=100.0, step=0.1, value=100, label="粘贴终点（%）")
+                mask_maskstart_slider = gr.Slider(minimum=0.0, maximum=100.0, step=0.1, value=50, label="掩码起点（%）")
+                mask_maskend_slider = gr.Slider(minimum=0.0, maximum=100.0, step=0.1, value=100, label="掩码终点（%）")
+                mask_softnessL_slider = gr.Slider(minimum=0.0, maximum=100.0, step=0.1, value=0, label="左侧柔化过渡（%）")
+                mask_softnessR_slider = gr.Slider(minimum=0.0, maximum=100.0, step=0.1, value=0, label="右侧柔化过渡（%）")
+                mask_marination_slider = gr.Slider(minimum=0.0, maximum=1, step=0.0001, value=0, label="融合强度", visible=False)
 
         with gr.Row():
-            generate_button = gr.Button("Generate", variant='primary', scale=1)
+            generate_button = gr.Button("开始生成", variant='primary', scale=1, elem_classes=["generate-btn"])
 
         with gr.Row():
             with gr.Column(scale=6):
-                video_output = gr.Video(label="Output Video", interactive=False)
-                audio_output = gr.Audio(label="Output Audio", interactive=False)
-                send_to_init_button = gr.Button("Send to Init Audio", scale=1, visible=False)
+                video_output = gr.HTML(label="输出视频预览")
+                audio_output = gr.Audio(label="输出音频", interactive=False)
+                send_to_init_button = gr.Button("发送到初始音频", scale=1, visible=False)
+
+        video_file.change(
+            fn=_file_obj_to_video_html,
+            inputs=[video_file],
+            outputs=[input_video_preview]
+        )
+
+        video_path.change(
+            fn=_text_path_to_video_html,
+            inputs=[video_path],
+            outputs=[input_video_preview]
+        )
+
         send_to_init_button.click(
             fn=lambda audio: audio,
             inputs=[audio_output],
@@ -616,27 +744,27 @@ def create_sampling_ui(model_options, model_config_map, inpainting=False):
         )
 
         inputs = [
-            prompt, 
+            prompt,
             negative_prompt,
             video_file,
             video_path,
             audio_prompt_file,
             audio_prompt_path,
-            seconds_start_slider, 
-            seconds_total_slider, 
-            cfg_scale_slider, 
-            steps_slider, 
-            preview_every_slider, 
-            seed_textbox, 
-            sampler_type_dropdown, 
-            sigma_min_slider, 
+            seconds_start_slider,
+            seconds_total_slider,
+            cfg_scale_slider,
+            steps_slider,
+            preview_every_slider,
+            seed_textbox,
+            sampler_type_dropdown,
+            sigma_min_slider,
             sigma_max_slider,
             cfg_rescale_slider,
             init_audio_checkbox,
             init_audio_input,
             init_noise_level_slider
         ]
-        
+
         if inpainting:
             inputs.extend([
                 mask_cropfrom_slider,
@@ -650,29 +778,200 @@ def create_sampling_ui(model_options, model_config_map, inpainting=False):
             ])
 
         generate_button.click(
-            fn=generate_cond, 
+            fn=generate_cond,
             inputs=inputs,
-            outputs=[
-                video_output,
-                audio_output
-            ], 
+            outputs=[video_output, audio_output],
             api_name="generate"
         )
 
+        if space_like and not inpainting:
+            gr.Markdown("## 示例")
+            with gr.Accordion("点击展开示例", open=True):
+                with gr.Row():
+                    gr.Markdown("**📝 任务：文本到音效**")
+                    with gr.Column(scale=1):
+                        gr.Markdown("Prompt: *Typing on a keyboard*")
+                        ex1 = gr.Button("加载示例")
+                    with gr.Column(scale=1):
+                        gr.Markdown("Prompt: *Ocean waves crashing*")
+                        ex2 = gr.Button("加载示例")
+                    with gr.Column(scale=1):
+                        gr.Markdown("Prompt: *Footsteps in snow*")
+                        ex3 = gr.Button("加载示例")
+
+                with gr.Row():
+                    gr.Markdown("**🎶 任务：文本到音乐**")
+                    with gr.Column(scale=1):
+                        gr.Markdown("Prompt: *An orchestral music piece for a fantasy world.*")
+                        ex4 = gr.Button("加载示例")
+                    with gr.Column(scale=1):
+                        gr.Markdown("Prompt: *Produce upbeat electronic music for a dance party*")
+                        ex5 = gr.Button("加载示例")
+                    with gr.Column(scale=1):
+                        gr.Markdown("Prompt: *A dreamy lo-fi beat with vinyl crackle*")
+                        ex6 = gr.Button("加载示例")
+
+            ex1.click(
+                lambda: _space_examples_values("1225575558", "Typing on a keyboard"),
+                inputs=[],
+                outputs=[
+                    prompt,
+                    seconds_start_slider,
+                    seconds_total_slider,
+                    cfg_scale_slider,
+                    steps_slider,
+                    preview_every_slider,
+                    seed_textbox,
+                    sampler_type_dropdown,
+                    sigma_min_slider,
+                    sigma_max_slider,
+                    cfg_rescale_slider
+                ]
+            )
+            ex2.click(
+                lambda: _space_examples_values("3615819170", "Ocean waves crashing"),
+                inputs=[],
+                outputs=[
+                    prompt,
+                    seconds_start_slider,
+                    seconds_total_slider,
+                    cfg_scale_slider,
+                    steps_slider,
+                    preview_every_slider,
+                    seed_textbox,
+                    sampler_type_dropdown,
+                    sigma_min_slider,
+                    sigma_max_slider,
+                    cfg_rescale_slider
+                ]
+            )
+            ex3.click(
+                lambda: _space_examples_values("1703896811", "Footsteps in snow"),
+                inputs=[],
+                outputs=[
+                    prompt,
+                    seconds_start_slider,
+                    seconds_total_slider,
+                    cfg_scale_slider,
+                    steps_slider,
+                    preview_every_slider,
+                    seed_textbox,
+                    sampler_type_dropdown,
+                    sigma_min_slider,
+                    sigma_max_slider,
+                    cfg_rescale_slider
+                ]
+            )
+            ex4.click(
+                lambda: _space_examples_values("1561898939", "An orchestral music piece for a fantasy world."),
+                inputs=[],
+                outputs=[
+                    prompt,
+                    seconds_start_slider,
+                    seconds_total_slider,
+                    cfg_scale_slider,
+                    steps_slider,
+                    preview_every_slider,
+                    seed_textbox,
+                    sampler_type_dropdown,
+                    sigma_min_slider,
+                    sigma_max_slider,
+                    cfg_rescale_slider
+                ]
+            )
+            ex5.click(
+                lambda: _space_examples_values("406022999", "Produce upbeat electronic music for a dance party"),
+                inputs=[],
+                outputs=[
+                    prompt,
+                    seconds_start_slider,
+                    seconds_total_slider,
+                    cfg_scale_slider,
+                    steps_slider,
+                    preview_every_slider,
+                    seed_textbox,
+                    sampler_type_dropdown,
+                    sigma_min_slider,
+                    sigma_max_slider,
+                    cfg_rescale_slider
+                ]
+            )
+            ex6.click(
+                lambda: _space_examples_values("807934770", "A dreamy lo-fi beat with vinyl crackle"),
+                inputs=[],
+                outputs=[
+                    prompt,
+                    seconds_start_slider,
+                    seconds_total_slider,
+                    cfg_scale_slider,
+                    steps_slider,
+                    preview_every_slider,
+                    seed_textbox,
+                    sampler_type_dropdown,
+                    sigma_min_slider,
+                    sigma_max_slider,
+                    cfg_rescale_slider
+                ]
+            )
+
         return demo
-    
-def create_txt2audio_ui(model_options, model_config_map):
-    with gr.Blocks() as ui:
-        with gr.Tab("Generation"):
-            create_sampling_ui(model_options, model_config_map)
-        with gr.Tab("Inpainting"):
-            create_sampling_ui(model_options, model_config_map, inpainting=True)    
+
+
+def create_txt2audio_ui(model_options, model_config_map, space_like=False):
+    with gr.Blocks(css="""
+        .gradio-container {
+            max-width: 90vw !important;
+            margin-left: 5vw !important;
+            margin-right: 5vw !important;
+        }
+        .app-banner {
+            width: 100% !important;
+            display: block !important;
+            text-align: center !important;
+            background: linear-gradient(135deg, #6a5cff 0%, #4b8bff 100%) !important;
+            border-radius: 12px !important;
+            padding: 18px 20px !important;
+            margin: 0 0 14px 0 !important;
+            color: #ffffff !important;
+            text-shadow: 0 1px 4px rgba(0, 0, 0, 0.35) !important;
+            box-sizing: border-box !important;
+        }
+        .app-banner h1 {
+            margin: 0 0 8px 0 !important;
+            font-size: 32px;
+            font-weight: 700;
+            color: #ffffff !important;
+            text-align: center !important;
+        }
+        .app-banner p {
+            margin: 0 !important;
+            font-size: 15px;
+            line-height: 1.6;
+            color: #ffffff !important;
+            text-align: center !important;
+        }
+        .generate-btn button {
+            background: linear-gradient(135deg, #6a5cff 0%, #4b8bff 100%) !important;
+            color: #ffffff !important;
+            border: none !important;
+            box-shadow: 0 2px 8px rgba(63, 98, 255, 0.35) !important;
+        }
+        .generate-btn button:hover {
+            background: linear-gradient(135deg, #5c4fff 0%, #3f7bff 100%) !important;
+            color: #ffffff !important;
+        }
+    """) as ui:
+        if space_like:
+            create_sampling_ui(model_options, model_config_map, inpainting=False, space_like=True)
+        else:
+            with gr.Tab("生成"):
+                create_sampling_ui(model_options, model_config_map, inpainting=False, space_like=False)
+            with gr.Tab("局部重绘"):
+                create_sampling_ui(model_options, model_config_map, inpainting=True, space_like=False)
     return ui
 
-def toggle_custom_model(selected_model):
-    return gr.Row.update(visible=(selected_model == "Custom Model"))
 
-def create_ui(model_config_path=None, ckpt_path=None, pretrained_name=None, pretransform_ckpt_path=None, model_half=False):
+def create_ui(model_config_path=None, ckpt_path=None, pretrained_name=None, pretransform_ckpt_path=None, model_half=False, space_like=False):
     global model_configurations
     global device
 
@@ -720,7 +1019,7 @@ def create_ui(model_config_path=None, ckpt_path=None, pretrained_name=None, pret
         }
         model_options = {"default": {}}
 
-    ui = create_txt2audio_ui(model_options, model_configurations)
+    ui = create_txt2audio_ui(model_options, model_configurations, space_like=space_like)
     return ui
 
 if __name__ == "__main__":
